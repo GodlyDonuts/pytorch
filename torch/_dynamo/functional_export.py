@@ -1293,6 +1293,7 @@ def _dynamo_graph_capture_for_export(
                     argument_names(inspect.signature(orig_callable), args, kwargs),  # type: ignore[attr-defined, arg-type]
                     in_spec,
                     out_spec,
+                    True,
                 )
             )
             transformed_graph.recompile()
