@@ -6,6 +6,7 @@ import logging
 import os
 import pickle
 import shutil
+import tempfile
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Literal, TYPE_CHECKING
@@ -563,6 +564,146 @@ def standalone_compile(
             )
 
     return CacheCompiledArtifact(compiled_fn, artifacts)
+
+
+def _iter_inductor_output_sources(artifact: CompiledArtifact) -> list[str]:
+    """Return the source of each Inductor output-code module bundled in ``artifact``.
+
+    Reads ``CompiledFxGraph.source_code`` straight from the cached graph(s) -- the
+    same source ``save(format="unpacked")`` writes to disk -- instead of writing the
+    modules out and reading them back. Loads the cache artifacts into a temporary
+    cache dir and mirrors the per-key / per-pickle structure of that unpacked save.
+
+    Raises NotImplementedError when the artifact is not saveable (e.g. a non-cacheable
+    HOP such as with_effects), which is the same "cannot lower this graph" outcome the
+    disk path produced.
+    """
+    import pickle
+
+    from .codecache import FxGraphCache
+
+    artifacts = getattr(artifact, "_artifacts", None)
+    if artifacts is None:
+        raise NotImplementedError(
+            "compile_to_python cannot lower this graph to standalone source: it "
+            "produced no saveable Inductor artifact (e.g. a non-cacheable HOP like "
+            "with_effects)."
+        )
+    artifact_bytes, _cache_info = artifacts
+    sources: list[str] = []
+    with tempfile.TemporaryDirectory() as cache_dir, temporary_cache_dir(cache_dir):
+        loaded = torch.compiler.load_cache_artifacts(artifact_bytes)
+        if loaded is None:
+            raise NotImplementedError(
+                "compile_to_python cannot lower this graph to standalone source: its "
+                "Inductor cache artifacts did not load."
+            )
+        for key in loaded.inductor_artifacts:
+            subdir = FxGraphCache._get_tmp_dir_for_key(key)
+            for name in sorted(os.listdir(subdir)):
+                with open(os.path.join(subdir, name), "rb") as f:
+                    graph = pickle.load(f)
+                sources.append(graph.source_code)
+    return sources
+
+
+def _extract_inductor_output_module(artifact: CompiledArtifact) -> str:
+    """Return the single Inductor output-code module that defines the runnable
+    module-level ``call`` entry point (``call = runner.call``).
+
+    No post-hoc stripping is needed: ``compile_to_python`` disables the benchmark
+    harness and the compile-time auto-tuning docstring at codegen time, so each
+    bundled module is already just the runnable kernels plus ``call``. standalone
+    compiles run under a fresh cache, so an Inductor-approved graph yields exactly one
+    such module.
+    """
+    runnable = [
+        s
+        for s in _iter_inductor_output_sources(artifact)
+        if "def call(" in s and "call = runner.call" in s
+    ]
+    if len(runnable) != 1:
+        raise RuntimeError(
+            f"expected exactly one runnable Inductor output module, found "
+            f"{len(runnable)}; compile_to_python cannot inline this artifact."
+        )
+    return runnable[0]
+
+
+def _binary_cache_bytes(artifact: CompiledArtifact) -> bytes | None:
+    """Serialize the artifact to opaque cache bytes, or None if it is not
+    serializable (e.g. graphs with input mutations currently do not produce a
+    saveable aot_autograd artifact). The source still runs standalone without it."""
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tf:
+        tmp = tf.name
+    try:
+        artifact.save(path=tmp, format="binary")
+        with open(tmp, "rb") as f:
+            return f.read()
+    except Exception:
+        # Some graphs legitimately have no saveable artifact (e.g. certain
+        # input-mutating graphs); the source still runs standalone without it. Log
+        # at debug so a genuine serialization regression is not silently masked as
+        # an "uncacheable" fallback (which only shows up as a missing FxGraphCache
+        # hit on reload).
+        log.debug("standalone artifact is not serializable; no cache", exc_info=True)
+        return None
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def compile_to_python(
+    gm: GraphModule,
+    example_inputs: Sequence[InputType],
+    *,
+    dynamic_shapes: DynamicShapesType = "from_example_inputs",
+    options: Any = None,
+) -> tuple[str, bytes | None]:
+    """Compile ``gm`` and return ``(inner_python, cache)`` -- the INNER half of the
+    backend contract behind ``torch.precompile``.
+
+    ``inner_python`` is the Inductor output module exposing ``call(args) -> outs``
+    for the post-AOTAutograd inner graph (dense, functionalized). It is the inductor
+    piece only: it carries NO prelude/epilogue (subclass flatten/unflatten, input-
+    mutation copy-back, output-alias regen, grad disabling). Those belong to the AOT
+    layer -- see ``torch._functorch.aot_autograd.compile_to_python``, which calls
+    this and composes AOTAutograd's codegen'd runtime wrappers around the result.
+    Callers must run ``call`` under ``torch.no_grad()`` (the kernels use out= ops).
+
+    The kernels JIT-compile from the inlined source on first call, so ``inner_python``
+    needs no cache. ``cache`` is an opaque acceleration (or ``None`` when the graph
+    is not serializable, e.g. some input-mutating graphs).
+
+    SIDE EFFECT: extracting the source unpacks the cache artifacts under a temporary
+    ``temporary_cache_dir``, which clears the process's in-memory Inductor caches. A
+    process that interleaves ``torch.compile`` and this call will lose its warm
+    in-memory compile caches (on-disk caches are unaffected).
+    """
+    # Suppress the two debug-only fragments at codegen time rather than stripping
+    # them out of the emitted source afterward (the export artifact is meant to run,
+    # not be profiled): benchmark_harness emits get_args()/benchmark_compiled_module()/
+    # __main__, and autotune_at_compile_time_emit_source prepends the no-op
+    # "Compile-time auto-tuning block" docstring. The real autotuning still runs
+    # (standalone_compile keeps triton.autotune_at_compile_time on).
+    with (
+        torch.no_grad(),
+        config.patch(
+            {
+                "benchmark_harness": False,
+                "triton.autotune_at_compile_time_emit_source": False,
+            }
+        ),
+    ):
+        artifact = standalone_compile(
+            gm,
+            example_inputs,
+            dynamic_shapes=dynamic_shapes,
+            options=options if options else {},
+        )
+    inner_python = _extract_inductor_output_module(artifact)
+    cache = _binary_cache_bytes(artifact)
+    return inner_python, cache
 
 
 def autograd_cache_key(
