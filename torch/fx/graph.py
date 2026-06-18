@@ -1148,6 +1148,45 @@ class _BoxedCodeGen(CodeGen):
         return fn_def
 
 
+class _PyTreeOutputCodeGen(CodeGen):
+    def __init__(self, out_spec: pytree.TreeSpec) -> None:
+        super().__init__()
+        self.out_spec = out_spec
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _PyTreeOutputCodeGen:
+        result = _PyTreeOutputCodeGen(self.out_spec)
+        memo[id(self)] = result
+        result._body_transformer = copy.deepcopy(self._body_transformer, memo)
+        result._func_name = self._func_name
+        return result
+
+    def process_outputs(self, out: Any) -> Any:
+        if not isinstance(out, (list, tuple)):
+            out = [out]
+        return pytree.tree_unflatten(out, self.out_spec)
+
+    def generate_output(
+        self,
+        output_args: Argument,
+        *,
+        descs: Sequence[str] | None = None,
+        repr_fn: Callable[[object], str] | None = None,
+    ) -> str:
+        if repr_fn is None:
+            repr_fn = repr
+        if descs is not None and isinstance(output_args, (list, tuple)):
+            return (
+                self._format_multiline_container(
+                    output_args,
+                    descs,
+                    "return pytree.tree_unflatten(",
+                    repr_fn=repr_fn,
+                )
+                + ", self._out_spec)"
+            )
+        return f"return pytree.tree_unflatten({repr_fn(output_args)}, self._out_spec)"
+
+
 class _PyTreeCodeGen(CodeGen):
     def __init__(self, pytree_info: _PyTreeInfo) -> None:
         super().__init__()
